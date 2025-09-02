@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+Pi Commander - Central Control System for AMFaces
+Controls: Motor (Portenta), Pressure Controller (AliCat), Phantom Camera
+Acts as bridge between MacBook GUI and hardware subsystems
+"""
+
+import serial
+import time
+import json
+import threading
+import logging
+from datetime import datetime
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('pi_commander.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class DeviceController:
+    """Base class for device controllers"""
+    
+    def __init__(self, name):
+        self.name = name
+        self.connected = False
+        self.last_command = None
+        self.status = "DISCONNECTED"
+    
+    def connect(self):
+        """Connect to device - override in subclasses"""
+        pass
+    
+    def disconnect(self):
+        """Disconnect from device - override in subclasses"""
+        pass
+    
+    def send_command(self, command):
+        """Send command to device - override in subclasses"""
+        pass
+    
+    def get_status(self):
+        """Get device status - override in subclasses"""
+        return self.status
+
+class MotorController(DeviceController):
+    """Controls Portenta motor system"""
+    
+    def __init__(self, port="/dev/ttyAMA0", baudrate=9600):
+        super().__init__("Motor")
+        self.port = port
+        self.baudrate = baudrate
+        self.serial_conn = None
+        self.current_position = 0
+        self.is_moving = False
+        
+    def connect(self):
+        """Connect to Portenta motor controller"""
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=5
+            )
+            time.sleep(2)  # Allow connection to stabilize
+            
+            # Send handshake
+            self.serial_conn.write("RESET:1\n".encode())
+            time.sleep(1)
+            
+            # Wait for ready signal
+            start_time = time.time()
+            while time.time() - start_time < 10:
+                if self.serial_conn.in_waiting > 0:
+                    response = self.serial_conn.readline().decode().strip()
+                    if "ARDUINO_READY" in response:
+                        self.connected = True
+                        self.status = "READY"
+                        logger.info(f"{self.name}: Connected successfully")
+                        return True
+                time.sleep(0.1)
+            
+            raise Exception("Motor controller not responding")
+            
+        except Exception as e:
+            logger.error(f"{self.name}: Connection failed - {e}")
+            self.status = "CONNECTION_ERROR"
+            return False
+    
+    def disconnect(self):
+        """Disconnect from motor controller"""
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+        self.connected = False
+        self.status = "DISCONNECTED"
+        logger.info(f"{self.name}: Disconnected")
+    
+    def send_command(self, command):
+        """Send motor command"""
+        if not self.connected:
+            logger.error(f"{self.name}: Not connected")
+            return False
+        
+        try:
+            # Parse command
+            if "SPEED:" in command and "DIST:" in command:
+                # Format: SPEED:1000;DIST:10
+                self.serial_conn.write(f"{command}\n".encode())
+                self.last_command = command
+                self.status = "MOVING"
+                self.is_moving = True
+                logger.info(f"{self.name}: Sent command - {command}")
+                return True
+            elif "HOME:" in command:
+                self.serial_conn.write(f"{command}\n".encode())
+                self.last_command = command
+                self.status = "HOMING"
+                logger.info(f"{self.name}: Sent homing command")
+                return True
+            else:
+                logger.error(f"{self.name}: Invalid command format - {command}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"{self.name}: Command failed - {e}")
+            return False
+    
+    def get_status(self):
+        """Get current motor status"""
+        if not self.connected:
+            return self.status
+        
+        try:
+            # Check for responses
+            while self.serial_conn.in_waiting > 0:
+                response = self.serial_conn.readline().decode().strip()
+                if "MOVEMENT_COMPLETE" in response:
+                    self.status = "READY"
+                    self.is_moving = False
+                elif "Homing Complete!" in response:
+                    self.status = "READY"
+                elif "DEBUG: Movement progress:" in response:
+                    # Extract progress percentage
+                    if "%" in response:
+                        try:
+                            percent_start = response.rfind(" ") + 1
+                            percent_end = response.find("%")
+                            progress = response[percent_start:percent_end]
+                            self.status = f"MOVING_{progress}%"
+                        except:
+                            pass
+            
+            return self.status
+            
+        except Exception as e:
+            logger.error(f"{self.name}: Status check failed - {e}")
+            return "ERROR"
+
+class PressureController(DeviceController):
+    """Controls AliCat pressure controller"""
+    
+    def __init__(self, port="/dev/ttyAMA1", baudrate=9600):
+        super().__init__("Pressure")
+        self.port = port
+        self.baudrate = baudrate
+        self.serial_conn = None
+        self.current_pressure = 0.0
+        self.target_pressure = 0.0
+        
+    def connect(self):
+        """Connect to AliCat pressure controller"""
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=5
+            )
+            time.sleep(2)
+            
+            # Send initialization command
+            self.serial_conn.write("INIT\n".encode())
+            time.sleep(1)
+            
+            # Check for response
+            if self.serial_conn.in_waiting > 0:
+                response = self.serial_conn.readline().decode().strip()
+                if "READY" in response or "OK" in response:
+                    self.connected = True
+                    self.status = "READY"
+                    logger.info(f"{self.name}: Connected successfully")
+                    return True
+            
+            # If no specific response, assume connected
+            self.connected = True
+            self.status = "READY"
+            logger.info(f"{self.name}: Connected (no handshake response)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"{self.name}: Connection failed - {e}")
+            self.status = "CONNECTION_ERROR"
+            return False
+    
+    def disconnect(self):
+        """Disconnect from pressure controller"""
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+        self.connected = False
+        self.status = "DISCONNECTED"
+        logger.info(f"{self.name}: Disconnected")
+    
+    def send_command(self, command):
+        """Send pressure command"""
+        if not self.connected:
+            logger.error(f"{self.name}: Not connected")
+            return False
+        
+        try:
+            # Parse command
+            if command.startswith("SET_PRESSURE:"):
+                pressure = float(command.split(":")[1])
+                if 0 <= pressure <= 15:  # Safety limit
+                    self.serial_conn.write(f"SET_PRESSURE:{pressure:.1f}\n".encode())
+                    self.target_pressure = pressure
+                    self.status = "SETTING_PRESSURE"
+                    self.last_command = command
+                    logger.info(f"{self.name}: Setting pressure to {pressure} BAR")
+                    return True
+                else:
+                    logger.error(f"{self.name}: Pressure out of range (0-15 BAR)")
+                    return False
+            elif command == "READ_PRESSURE":
+                self.serial_conn.write("READ_PRESSURE\n".encode())
+                self.last_command = command
+                logger.info(f"{self.name}: Reading current pressure")
+                return True
+            else:
+                logger.error(f"{self.name}: Invalid command - {command}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"{self.name}: Command failed - {e}")
+            return False
+    
+    def get_status(self):
+        """Get current pressure status"""
+        if not self.connected:
+            return self.status
+        
+        try:
+            # Check for responses
+            while self.serial_conn.in_waiting > 0:
+                response = self.serial_conn.readline().decode().strip()
+                if "PRESSURE_SET" in response:
+                    self.status = "READY"
+                elif "CURRENT_PRESSURE:" in response:
+                    try:
+                        pressure_str = response.split(":")[1]
+                        self.current_pressure = float(pressure_str)
+                        self.status = f"READY_{self.current_pressure:.1f}BAR"
+                    except:
+                        pass
+            
+            return self.status
+            
+        except Exception as e:
+            logger.error(f"{self.name}: Status check failed - {e}")
+            return "ERROR"
+
+class CameraController(DeviceController):
+    """Controls Phantom camera (placeholder for Windows SDK)"""
+    
+    def __init__(self):
+        super().__init__("Camera")
+        self.recording = False
+        self.frame_rate = 1000
+        self.recording_time = 0
+        
+    def connect(self):
+        """Connect to Phantom camera"""
+        try:
+            # Placeholder for Windows SDK integration
+            # In reality, this would use the Phantom SDK
+            logger.warning(f"{self.name}: Phantom SDK requires Windows - using simulation mode")
+            self.connected = True
+            self.status = "SIMULATION_MODE"
+            return True
+        except Exception as e:
+            logger.error(f"{self.name}: Connection failed - {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from camera"""
+        self.connected = False
+        self.status = "DISCONNECTED"
+        logger.info(f"{self.name}: Disconnected")
+    
+    def send_command(self, command):
+        """Send camera command"""
+        if not self.connected:
+            logger.error(f"{self.name}: Not connected")
+            return False
+        
+        try:
+            if command.startswith("START_RECORDING:"):
+                # Format: START_RECORDING:1000fps,5s
+                params = command.split(":")[1].split(",")
+                self.frame_rate = int(params[0].replace("fps", ""))
+                if len(params) > 1:
+                    self.recording_time = int(params[1].replace("s", ""))
+                
+                # Simulate recording start
+                self.recording = True
+                self.status = f"RECORDING_{self.frame_rate}fps"
+                self.last_command = command
+                logger.info(f"{self.name}: Started recording at {self.frame_rate} fps")
+                return True
+                
+            elif command == "STOP_RECORDING":
+                self.recording = False
+                self.status = "READY"
+                self.last_command = command
+                logger.info(f"{self.name}: Stopped recording")
+                return True
+                
+            elif command.startswith("SET_FRAMERATE:"):
+                self.frame_rate = int(command.split(":")[1])
+                self.status = f"READY_{self.frame_rate}fps"
+                self.last_command = command
+                logger.info(f"{self.name}: Set frame rate to {self.frame_rate} fps")
+                return True
+                
+            else:
+                logger.error(f"{self.name}: Invalid command - {command}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"{self.name}: Command failed - {e}")
+            return False
+    
+    def get_status(self):
+        """Get camera status"""
+        return self.status
+
+class PiCommander:
+    """Main controller class that routes commands to devices"""
+    
+    def __init__(self):
+        self.motor = MotorController()
+        self.pressure = PressureController()
+        self.camera = CameraController()
+        self.devices = [self.motor, self.pressure, self.camera]
+        self.mac_connection = None
+        self.running = False
+        
+    def start(self):
+        """Start the Pi Commander system"""
+        logger.info("Starting Pi Commander...")
+        
+        # Connect to all devices
+        for device in self.devices:
+            if device.connect():
+                logger.info(f"Connected to {device.name}")
+            else:
+                logger.error(f"Failed to connect to {device.name}")
+        
+        # Start command processing loop
+        self.running = True
+        self.command_loop()
+    
+    def stop(self):
+        """Stop the Pi Commander system"""
+        logger.info("Stopping Pi Commander...")
+        self.running = False
+        
+        # Disconnect from all devices
+        for device in self.devices:
+            device.disconnect()
+        
+        logger.info("Pi Commander stopped")
+    
+    def command_loop(self):
+        """Main command processing loop"""
+        while self.running:
+            try:
+                # Check device statuses
+                for device in self.devices:
+                    device.get_status()
+                
+                # Process any incoming commands (placeholder for Mac communication)
+                # In reality, this would listen on a serial port or network socket
+                
+                time.sleep(0.1)  # 100ms loop
+                
+            except KeyboardInterrupt:
+                logger.info("Received interrupt signal")
+                break
+            except Exception as e:
+                logger.error(f"Command loop error: {e}")
+                time.sleep(1)
+    
+    def route_command(self, command):
+        """Route incoming command to appropriate device"""
+        try:
+            logger.info(f"Routing command: {command}")
+            
+            # Parse compound commands (multiple commands separated by semicolons)
+            if ";" in command:
+                commands = command.split(";")
+                results = []
+                for cmd in commands:
+                    result = self._execute_single_command(cmd.strip())
+                    results.append(result)
+                return results
+            else:
+                return self._execute_single_command(command)
+                
+        except Exception as e:
+            logger.error(f"Command routing failed: {e}")
+            return False
+    
+    def _execute_single_command(self, command):
+        """Execute a single command"""
+        try:
+            if command.startswith("MOTOR:"):
+                # Remove MOTOR: prefix and send to motor controller
+                motor_cmd = command[6:]  # Remove "MOTOR:"
+                return self.motor.send_command(motor_cmd)
+                
+            elif command.startswith("PRESSURE:"):
+                # Remove PRESSURE: prefix and send to pressure controller
+                pressure_cmd = command[9:]  # Remove "PRESSURE:"
+                return self.pressure.send_command(pressure_cmd)
+                
+            elif command.startswith("CAMERA:"):
+                # Remove CAMERA: prefix and send to camera controller
+                camera_cmd = command[7:]  # Remove "CAMERA:"
+                return self.camera.send_command(camera_cmd)
+                
+            elif command == "STATUS":
+                # Return status of all devices
+                status = {}
+                for device in self.devices:
+                    status[device.name] = {
+                        "connected": device.connected,
+                        "status": device.get_status(),
+                        "last_command": device.last_command
+                    }
+                return status
+                
+            elif command == "RESET_ALL":
+                # Reset all devices
+                for device in self.devices:
+                    if hasattr(device, 'reset'):
+                        device.reset()
+                return True
+                
+            else:
+                logger.error(f"Unknown command: {command}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Command execution failed: {e}")
+            return False
+    
+    def get_system_status(self):
+        """Get overall system status"""
+        status = {
+            "timestamp": datetime.now().isoformat(),
+            "system": "RUNNING" if self.running else "STOPPED",
+            "devices": {}
+        }
+        
+        for device in self.devices:
+            status["devices"][device.name] = {
+                "connected": device.connected,
+                "status": device.get_status(),
+                "last_command": device.last_command
+            }
+        
+        return status
+
+def main():
+    """Main function to run Pi Commander"""
+    try:
+        commander = PiCommander()
+        commander.start()
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal")
+    except Exception as e:
+        logger.error(f"Pi Commander failed: {e}")
+    finally:
+        if 'commander' in locals():
+            commander.stop()
+
+if __name__ == "__main__":
+    main()
